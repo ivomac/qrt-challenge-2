@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 << 'EOF'
+Usage: nb <command> <notebook.ipynb> [args]
+
+Commands:
+  pull <notebook.ipynb>
+      Sync .ipynb -> .py (jupytext percent format). Prints the .py path.
+
+  push <notebook.ipynb>
+      Sync .py -> .ipynb. Prints the .py path.
+
+  run <notebook.ipynb> [first_cell [last_cell]]
+      Execute notebook in-place via nbconvert.
+      Cell indices are 0-based, counting ALL cells (markdown + code),
+      matching the # %% markers in the .py mirror.
+
+  output <notebook.ipynb> [first_cell [last_cell]]
+      Extract and print cell outputs as text.
+      Cell indices are 0-based, counting ALL cells (markdown + code),
+      matching the # %% markers in the .py mirror.
+EOF
+  exit 1
+}
+
+die() { echo "nb: $*" >&2; exit 1; }
+
+py_path() {
+  local dir name
+  dir="$(dirname "$1")"
+  name="$(basename "$1" .ipynb)"
+  echo "${dir}/${name}.py"
+}
+
+cmd_pull() {
+  [[ $# -lt 1 ]] && die "pull requires a notebook path"
+  local nb="$1"
+  [[ "$nb" == *.ipynb ]] || die "expected .ipynb file, got: $nb"
+  [[ -f "$nb" ]] || die "file not found: $nb"
+  jupytext --to py:percent "$nb" >&2
+  py_path "$nb"
+}
+
+cmd_push() {
+  [[ $# -lt 1 ]] && die "push requires a notebook path"
+  local nb="$1"
+  [[ "$nb" == *.ipynb ]] || die "expected .ipynb file, got: $nb"
+  local py
+  py="$(py_path "$nb")"
+  [[ -f "$py" ]] || die ".py mirror not found: $py"
+  jupytext --update --to notebook "$py" >&2
+  echo "$py"
+}
+
+cmd_run() {
+  [[ $# -lt 1 ]] && die "run requires a notebook path"
+  local nb="$1" first="${2-}" last="${3-}"
+  [[ "$nb" == *.ipynb ]] || die "expected .ipynb file, got: $nb"
+  [[ -f "$nb" ]] || die "file not found: $nb"
+
+  local args=(jupyter nbconvert --to notebook --execute --inplace)
+  [[ -n "$first" ]] && args+=(--ExecutePreprocessor.first_notebook_cell="$first")
+  [[ -n "$last"  ]] && args+=(--ExecutePreprocessor.last_notebook_cell="$last")
+  args+=("$nb")
+
+  "${args[@]}"
+}
+
+cmd_output() {
+  [[ $# -lt 1 ]] && die "output requires a notebook path"
+  local nb="$1" first="${2-}" last="${3-}"
+  [[ "$nb" == *.ipynb ]] || die "expected .ipynb file, got: $nb"
+  [[ -f "$nb" ]] || die "file not found: $nb"
+
+  local slice
+  if [[ -z "$first" && -z "$last" ]]; then
+    slice=".cells[]"
+  elif [[ -z "$first" ]]; then
+    slice=".cells[:$((last + 1))][]"
+  elif [[ -z "$last" ]]; then
+    slice=".cells[$first:][]"
+  else
+    slice=".cells[$first:$((last + 1))][]"
+  fi
+
+  jq -r "[
+    ${slice} |
+    select(.cell_type == \"code\") |
+    .outputs[]? |
+    if .output_type == \"stream\" then
+      .text | if type == \"array\" then join(\"\") else . end
+    elif .output_type == \"error\" then
+      ([.ename, .evalue] + .traceback) | join(\"\n\")
+    elif (.output_type == \"display_data\" or .output_type == \"execute_result\") then
+      (.data[\"text/html\"] // .data[\"text/plain\"] // empty) |
+      if type == \"array\" then join(\"\") else . end
+    else empty
+    end
+  ] | join(\"\n---\n\")" "$nb"
+}
+
+[[ $# -lt 1 ]] && usage
+
+cmd="$1"; shift
+
+case "$cmd" in
+  pull) cmd_pull "$@" ;;
+  push) cmd_push "$@" ;;
+  run)  cmd_run  "$@" ;;
+  output)  cmd_output  "$@" ;;
+  *)    die "unknown command: $cmd" ;;
+esac

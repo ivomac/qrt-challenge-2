@@ -1,134 +1,164 @@
-Challenge context
-Trust or Short? Predicting the Performance of daily Asset Allocations
+# [QRT Challenge](https://challengedata.ens.fr/participants/challenges/167/)
 
-In the world of systematic trading, asset allocations are everywhere — but signal quality is everything.
+This is mostly a notebook dump of the state of my code at challenge end. Expect some inconsistencies and outdated notebooks. Full pipeline: raw data preprocessing, analysis, feature engineering, LightGBM model fitting.
 
-Each day, traders are flooded with candidate allocations: portfolio constructions based on recent signals, liquidity flows, or historical patterns. Some of these portfolios will perform well in the next trading session. Others will underperform—or worse, underperform so consistently that shorting them might be the more profitable move.
+Best public score I achieved was 52.08%, at rank 245 out of 1180.
 
-This challenge centers around a simple yet high-stakes question:
-Can you predict whether a given asset allocation is worth following — or shorting?
-What is an Asset Allocation ?
+Full challenge description in [CHALLENGE.md](CHALLENGE.md).
 
-An asset allocation, is a systematic method of constructing a portfolio of assets using predefined signals or rules. In this challenge, each allocation is defined by a set of portfolio weights, that can be positive or negative, applied on a specific day and held for one trading session. From one day to another, an allocation can rebalance its weights to a certain proportion, called turnover, depending on the rules used to compute it. The returns of an asset allocation reflects the aggregated performance of these weighted positions rebalanced every day.
-Mathematical Definition
+## Recommended installation
 
-For a given trading day t, an allocation S, and M assets in a trading universe. Let :
+Using a local virtual environment and install the requirements:
+```
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-The weights of allocation S at time t :
+A first-time will need to register the env as a kernel to use it in JupyterLab
+```
+python -m ipykernel install --user --name=qrt-venv --display-name="QRT-venv"
+```
 
-wS,t=(wS,t,1,wS,t,2,...,wS,t,M)wS,t=(wS,t,1,wS,t,2,...,wS,t,M)
+## Problem
 
-The performance, also often referred as Return, of asset i from day t to day t+1 :
+Each row in the dataset contains historical data on the performance of several portfolios: 20 days of historical returns, volumes, and median turnover.
 
-ri,t+1ri,t+1
+The goal is to predict whether the next-day return will be positive/negative.
 
-Then the realized return of an allocation S at t+1 is given by :
+## Data Overview
 
-rS,t+1=∑i=1MwS,t,i∗ri,t+1rS,t+1=∑i=1MwS,t,i∗ri,t+1
-Challenge goals
+- 527,073 training observations, 31,870 test observations
+- Evaluation metric: sign accuracy (balanced accuracy)
 
-Each row in the dataset represents a day and an asset allocation, materialized as a portfolio constructed and rebalanced on that day. We give you a history of how that allocation behaved when rebalanced over the past 20 trading days: its daily performance, liquidity behaviour (proxied through weighted volumes), and median turnover.
+Each row has a specific day tag, allocation/portfolio tag, and group tag. The allocation is a subdivision of group. Each day contains a single row per allocation: *(day, alloc)* tuples are unique.
 
-The goal is to use that historical footprint to predict the sign of the allocation’s performance on the following day.
+There are 4 groups, 278 different allocations, and 2522 days in the training set.
 
-    If the model predicts positive return → trust the allocation.
-    If the model predicts negative return → short the allocation.
+Crucially, the days are anonymized and shuffled. The day tags only separate days and carry no order information. The only temporal connection we have is within-row (20 day history) and between rows of the same day.
 
-Evaluation Metric
+As far as I could tell from analysis, the 20-day windows of each "day" tag do not overlap: I could not find any shifted correspondence of the returns between rows of the same allocation on different days.
 
-You will be evaluated based on accuracy, which measures how often the model correctly predicts the direction (sign) of an allocation’s next-day return.
+## Benchmarks
 
-For each row i indexed by a time stamp t and an allocation S, we provide the true returns r_i for the following trading day. Your model must predict the sign of that return:
+A benchmark included with the challenge sets a minimum accuracy of 50.79%.
 
-    1 if you believe the allocation will have a positive return (go long)
-    0 if you believe the return will be negative.
+Data analysis reveals that the last return (`RET_1`) is the most predictive feature of tomorrow's return (I call it `RET_0`): On the training dataset, the sign of `RET_1` agrees with the target `RET_0` 51.89% overall on train.
 
-Only the sign is evaluated — not your capacity to predict the return’s magnitude.
+## Script/Notebook Pipeline
 
-Accuracy=1N∑i=1N1[sign(r^i)=sign(ri)]Accuracy=N1∑i=1N1[sign(r^i)=sign(ri)]
+```
+data/0-raw/ (CSV)
+    v
+[1a] Preprocessing
+    v
+[2a-2e] Analysis (insights for  engineering)
+    v
+[3a] Post-processing
+    v
+[3b] Feature Engineering
+    v
+[3c] Feature Filtering
+    v
+[4b] LightGBM Huber (pruning) -> submission
+[4c] LightGBM Huber (Optuna) -> submission
+```
 
-Accuracy=1T∗M∑t=1T∑S=1M1[sign(r^S,t+1)=sign(rS,t+1)]Accuracy=T∗M1∑t=1T∑S=1M1[sign(r^S,t+1)=sign(rS,t+1)]
+## Quick Start
 
-Where:
+All scripts are Jupytext percent-format Python files in `notebooks/`. They can be:
 
-    N is the number of rows
+- Opened as Jupyter notebooks (`bin/nb push script.py`)
+- Run as standalone Python scripts (`python script.py`)
 
-    sign(x) = 1 if x > 0, else 0
+## Pipeline Stages
 
-    1 is the indicator function (equals 1 if the condition is true, 0 otherwise)
+### Stage 1: Preprocessing
 
-    The true next day return for allocation S at timestamp t:
+**`1a-data-preprocessing.py`** -- Loads raw CSV data, renames columns (`MEDIAN_DAILY_TURNOVER` to `TURN`, `SIGNED_VOLUME_*` to `SVOL_*`, `ALLOCATION` to `ALLOC`), strips string prefixes from identifiers, merges target into feature DataFrame as `RET_0`, and saves as Parquet.
 
-ri=rS,t+1ri=rS,t+1
+### Stage 2: Analysis
 
-    The predicted next day return for allocation S at timestamp t:
+**`2a-analysis-data_overview.py`** -- Comprehensive data survey covering:
 
-ri^=r^S,t+1ri^=r^S,t+1
-Data description
+- **Data structure**: SVOL_1 has 73.5% NaN rate (ALLOC-dependent; 24 ALLOCs 0% NaN, 254 ALLOCs >50% NaN). ALLOC 14 and 46 have only 19 train rows each (46 also has duplicate rows). 2,522 unique TS, 278 ALLOCs, 4 GROUPs. RET_0 is 100% NaN in test by design.
+- **Feature distributions**: RET_* follow approximate non-central t (clip to +/-0.01 trims 1% tails). SVOL_* are bimodal with peaks at +/-1 and heavy tails (kurtosis 359). TURN has 3-5 log-normal modes spanning 10^-12 to 10.
+- **Train vs test**: No TS overlap. All 278 ALLOCs appear in both sets. Train row counts per TS vary widely (19-276); test is uniform (102-116 per ALLOC). GROUP 3 underrepresented in test (-7 pp), GROUP 1 overrepresented (+6 pp).
+- **Distribution shifts**: KS tests find statistically significant shifts in 35/41 features, but practically small: post-clip mean |D_pp| = 0.026 (2.6% of a standard deviation). Clipping does not reduce KS because the shift is in the bulk, not tails.
+- **Target bias**: Per-allocation target deviations range -3.3% to +12.5% (EB-shrunk). In-sample Spearman rho=+0.74, but out-of-sample drops to rho=+0.28 -- ALLOC aggregates may not generalize.
+- **Clip bounds** determined via Q-Q plots: RET +/-0.01, SVOL +/-7.5, TURN [1e-4, 1.6].
 
-The dataset is formatted as a time series with a multi-index of (date, allocation).
-Each row contains:
+**`2b-analysis-time_reverse_eng.py`** -- Attempts to reconstruct the anonymized temporal order by matching overlapping RET sequences. No matches found, time order appears unreconstructable, no data overlap between days. If so, then data augmentation through shifting should be valuable?
 
-    20-day history of allocation returns
-    20-day history of volume-weighted liquidity behavior
-    Allocation median turnover
-    Allocation anonymized GROUP
-    Next day allocation return: The performance of the allocation on the next day. You are given the true performance for training, but you will be only evaluated on your capacity to predict its sign.
+**`2c-analysis-signal_and_noise.py`** -- Variance decomposition of the target: 93% is residual noise after removing day and allocation effects. Day variance is approx ~8% and allocation variance is ~1.8%.
 
-Columns
+**`2d-analysis-correlation.py`** -- Spearman correlations and mutual information with target. RET_1 dominates (rho=+0.061), TURNOVER follows, then RET_7-9 (~1 week ago).
 
-    TS Timestamp of the snapshot (Dates were anonymized and shuffled so there is no guarantee of continuity even if the labels are called DATE_0001, DATE_0002, DATE_0003 )
-    ALLOCATION Name of the Allocation ( ALLOCATION_01 is the same for DATE_0001, DATE_0002 etc…)
-    RET_{i} for i in 1,…,20 - Allocation’s return on last day i
-    SIGNED_VOLUME_{i} for i in 1,…,20 - Allocation’s signed volume on last day i. See below for definition.
-    MEDIAN_DAILY_TURNOVER - Allocation’s median daily turnover. See below for definition.
-    GROUP - Anonymized Allocation group.
-    TARGET - Allocation’s true next day return.
+**`2e-analysis-ret1_heuristic.py`** -- The RET\_1 sign baseline achieves 51.89% balanced accuracy. Signal is consistent across 59% of days. Sign accuracy is correlated with RET\_1 magnitude: RET\_0 is more likely to have the same sign as RET\_1 the bigger RET\_1 is. Threshold optimizations (global, per-ALLOC, per-TS) are either weak or do not generalize.
 
-More details about volumes, allocation weights, and turnover.
+### Stage 3: Features
 
-At every day t, each allocation S follows this property, given a universe of M trading instruments :
+**`3a-feature-processing.py`** -- Drops ALLOC 14 and 46, applies clip bounds from
+2a analysis, normalizes by clip half-range (values ~[-1, 1]), downcasts to float32.
 
-∀t , ∀S:∑i=1M∣wS,i,t∣=1∀t , ∀S:∑i=1M∣wS,i,t∣=1
+**`3b-feature-engineering.py`** -- Generates ~4800 engineered features using Polars
+for memory efficiency:
+- Element-wise derived series (VOLUME, pos/neg clips, cross-products, polynomials)
+- Timestamp-level statistics (mean, std, max, min, percentile rank)
+- TS-demeaned and TS-zscored versions of all base series
+- Row aggregates across 5 time windows x 15 vector families x ~10 operations
+- Cross-period ratios of row aggregates
+- Fold-safe per-allocation statistics (computed from training fold only)
+- 12-fold TS-based KFold split with column-pruned
 
-The SIGNED_VOLUME of an allocation S at t is given by :
+**`3c-feature-filter.py`** -- Computes Spearman rank correlation of all features vs
+target, then greedily removes redundant features (|rho| >= 0.95 with any kept
+feature) with the same feature mask applied to all folds.
 
-VS,t=∑i=1MwS,t,i∗Vi,tVS,t=∑i=1MwS,t,i∗Vi,t
+### Stage 4: Fitting
 
-Where V_{i,t} is the total volume traded on the market of asset i during the trading session at timestamp t.
-For homogeneity, these V_{S,t} were rescaled in a rolling fashion to ensure comparability across different style of allocations
+**`4b-fitting-lightgbm_huber.py`** -- LightGBM with Huber loss and iterative
+feature selection. Each round trains 12 folds, computes gain importance, and drops
+features with low importance (mean/std ratio < threshold). Converges in one round.
+Generates test submission via median of fold-level predictions.
 
-The MEDIAN_DAILY_TURNOVER of an allocation S at t is given by :
+**`4c-fitting-lightgbm_huber_optuna.py`** -- Optuna hyperparameter tuning with
+200 trials, each running 12-fold CV. Tunes learning rate, tree structure, and
+regularization parameters. Uses a curated subset of features. Trial history saved to SQLite.
 
-TOS,t=TURNOVERS,t=∑i=1M∣wS,t,i−wS,t−1,i∣TOS,t=TURNOVERS,t=∑i=1M∣wS,t,i−wS,t−1,i∣
+## Shift Augmentation
 
-MDTS,t=median(TOS,t,TOS,t−1,...,TOS,t−20)MDTS,t=median(TOS,t,TOS,t−1,...,TOS,t−20)
-Files
+The `notebooks/shift_augmented/` directory contains an experiment with time-shift
+data augmentation -- creating synthetic training examples by shifting the 20-day
+feature window backwards. This approach achieves too high train/val accuracies, it must be leaky but I didn't understand how exactly if the 20-day windows don't have overlaps.
 
-All files are indexed by a unique ROW_ID, refering to a unique tuple (date, allocation), allowing you to map X_train with Y_train
+## Project Structure
 
-    X_train.csv - the training set features
-    y_train.csv - the training set target
-    X_test.csv - the test set features
-    sample_submission.csv - a random submission file in the correct format
-    benchmark_submission.ipynb - a benchmark submission notebook to generate the benchmark you see in the leaderboard.
+```
+|-- README.md
+|-- CHALLENGE.md                 # Full problem description
+|-- AGENTS.md
+|-- bin/nb                       # Jupytext script
+|-- data/
+|   |-- 0-raw/                   # Input CSV files
+|   |-- ...                      # Staged outputs
+|-- notebooks/
+    |-- tools.py                 # Shared utilities (I/O, metrics, plotting)
+    |-- ...
+    |-- archive/                 # Archived experiments
+    |   |-- ...
+    |-- shift_augmented/         # Shift augmentation experiment
+        |-- ...
+```
 
-527073 observations (i.e. lines) are available in the train set, while 31870 observations are in the test set.
-Benchmark description
+## Notebook Usage
 
-You will find in the data section a Benchmark Notebook generating the benchmark submission you see in the leaderboard.
+Each `.py` file is a Jupytext percent-format mirror of a Jupyter notebook. Use the
+`bin/nb` tool to sync:
 
-The Benchmark Notebook also allows you to see how to correctly generate a submission file.
-
-Here is a breakdown of what you can find in the notebook :
-
-    additional features representing the average historical performance of the allocations on multiple windows
-    additional features representing the average historical performance of all allocations on multiple windows
-    additional features representing the historical volatility of each allocation on the past 20 days
-    additional features representing the average historical volatility of all allocation on the past 20 days
-    a ridge fitted on all + additional features.
-    a lightgbm model fitted on all + additional features, with a cross validation section ( benchmark submitted ).
-
-The public score, visible on the leaderboard, of the lgbm model is 0.5079.
-
+```bash
+bin/nb pull notebooks/notebook.ipynb   # .ipynb -> .py
+bin/nb push notebooks/notebook.ipynb   # .py -> .ipynb
+bin/nb run  notebooks/notebook.ipynb   # execute notebook
+```
 
